@@ -1,3 +1,12 @@
+# import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9501))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     pass
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,17 +26,19 @@ Generate responses given a dataset of prompts
 import csv
 import ray
 import numpy as np
-import hydra
+
 import os
 from tabulate import tabulate
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 # os.environ['TORCH_COMPILE_DISABLE'] = '1'
+os.environ['HYDRA_FULL_ERROR'] = "1"
 
 from verl.utils.model import compute_position_id_with_mask
 
 import pandas as pd
+import hydra
 
 from transformers import AutoTokenizer
 
@@ -88,6 +99,7 @@ def main(config):
             for chat in batch_chat_lst:
                 repeated_chat_lst.extend([chat] * config.data.n_samples)
             
+            # ------------------------------
             inputs = tokenizer.apply_chat_template(repeated_chat_lst,
                                                  add_generation_prompt=True,
                                                  padding=True,
@@ -132,7 +144,8 @@ def main(config):
             output_text_unpad = []
             for text in output_text:
                 output_text_unpad.append(text.replace(pad_token, ''))
-
+            # ------------------------------
+            
             output_lst.extend(output_text_unpad)
 
         # Reshape output_lst from (total_samples,) to (n_data, n_samples)
@@ -156,6 +169,7 @@ def main(config):
     reward_model_data = dataset[config.data.reward_model_key]
 
     passes = 0
+    passes_16 = 0
     total = len(dataset)
     total_scores = []
     
@@ -171,14 +185,20 @@ def main(config):
             score = reward_fn(r, ground_truth)
             score_lst.append(score)
         max_score = np.max(score_lst)
+        max_score_16 = np.max(score_lst[:16])
         total_scores.append(score_lst)
         if max_score == 1:
             passes += 1
+        if max_score_16 == 1:
+            passes_16 += 1
 
     n_samples = config.data.n_samples
     pass_at_n = passes / total
+    pass_at_16 = passes_16 / total
     pass_at_1 = np.mean(total_scores)
-
+    dataset['correct'] = total_scores
+    dataset.to_parquet(config.data.output_path)
+    
     # Save metrics to CSV
     csv_path = os.path.join(output_dir, 'pass.csv')
     
@@ -189,6 +209,7 @@ def main(config):
         'model_path': config.model.path,
         'dataset': dataset_name,
         'pass@1': pass_at_1,
+        'pass@16': pass_at_16,
         f'pass@{n_samples}': pass_at_n
     }
 

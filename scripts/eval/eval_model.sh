@@ -1,4 +1,4 @@
-set -x
+# set -x
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
@@ -48,7 +48,7 @@ for DATA_TYPE in "${DATATYPES[@]}"; do
         trainer.n_gpus_per_node=8 \
         data.path=$HOME/deepscaler/data/${DATA_TYPE}.parquet \
         data.output_path=${OUTPUT_DIR}/${DATA_TYPE}.parquet \
-        data.n_samples=16 \
+        data.n_samples=32 \
         data.batch_size=2048 \
         model.path=${MODEL_PATH} \
         rollout.temperature=0.6 \
@@ -58,3 +58,19 @@ for DATA_TYPE in "${DATATYPES[@]}"; do
         rollout.gpu_memory_utilization=0.9 \
         rollout.tensor_model_parallel_size=1
 done
+
+# aime, amc, math, minerva, olympiad_bench
+
+# Test
+# bash scripts/eval/eval_model.sh --model /processing_data/search/zengziyang/DeepScaleR-1.5B-Preview --datasets aime aime25 --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepScaleR-1.5B-Preview
+
+# Official
+# ( bash scripts/eval/eval_model.sh --model /model_load/DeepSeek-R1-Distill-Qwen-1.5B --datasets aime aime25 math minerva olympiad_bench --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepSeek-R1-Distill-Qwen-1.5B &)
+# ( bash scripts/eval/eval_model.sh --model /model_load/DeepSeek-R1-Distill-Qwen-7B --datasets aime aime25 amc math minerva olympiad_bench --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepSeek-R1-Distill-Qwen-7B &)
+
+
+# ( bash scripts/eval/eval_model.sh --model /model_load/DeepSeek-R1-Distill-Qwen-1.5B --datasets olympiad_bench --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepSeek-R1-Distill-Qwen-1.5B &)
+# ( bash scripts/eval/eval_model.sh --model /model_load/DeepSeek-R1-Distill-Qwen-7B --datasets olympiad_bench --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepSeek-R1-Distill-Qwen-7B &)
+
+
+# bash scripts/eval/eval_model.sh --model /model_load/DeepSeek-R1-Distill-Qwen-1.5B --datasets amc --output-dir /data_train/search/zengziyang/projects/deepscaler/outputs/DeepSeek-R1-Distill-Qwen-1.5B

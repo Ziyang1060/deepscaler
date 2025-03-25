@@ -28,6 +28,7 @@ class TestDataset(enum.Enum):
     Contains identifiers for datasets used to evaluate model performance.
     """
     AIME = 'AIME'  # American Invitational Mathematics Examination
+    AIME25 = 'AIME25'  # American Invitational Mathematics Examination
     AMC = 'AMC'    # American Mathematics Competition  
     MATH = 'MATH'  # Math 500 problems
     MINERVA = 'MINERVA'  # Minerva dataset
