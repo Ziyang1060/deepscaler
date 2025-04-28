@@ -15,6 +15,7 @@ from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
 
 from deepscaler.data.utils import load_dataset
 from deepscaler.data.dataset_types import TrainDataset, TestDataset
+import json
 
 
 def extract_solution(solution_str: str) -> str:
@@ -29,7 +30,7 @@ def extract_solution(solution_str: str) -> str:
     return remove_boxed(last_boxed_only_string(solution_str))
 
 
-def make_map_fn(split: str):
+def make_map_fn(split: str, dataset_name: str):
     """Create a mapping function to process dataset examples.
 
     Args:
@@ -38,14 +39,19 @@ def make_map_fn(split: str):
     Returns:
         Function that processes individual dataset examples
     """
-    def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
-        question = example.pop('problem')
+    def process_fn(example: Dict[str, Any], idx: int, dataset_name: str) -> Optional[Dict[str, Any]]:
+        problem = example.pop('problem')            
         instruction = "Let's think step by step and output the final answer within \\boxed{}."
-        question = f"{question} {instruction}"
+        ability = "math"
+        if dataset_name == "gpqa":
+            ability = "multi_choice"
+        # if dataset_name == 'gpqa':
+        #     instruction = "Let's think step by step and output the final answer in the form of: Answer: X, where X either be Yes or No."
+        question = f"{problem} {instruction}"
         answer = example.pop('answer')
 
         data = {
-            "data_source": "",
+            "data_source": dataset_name,
             "prompt": [{
                 "role": "user",
                 "content": question
@@ -81,35 +87,40 @@ if __name__ == '__main__':
     # Initialize datasets
     train_datasets = [TrainDataset.DEEPSCALER]
     train_dataset = load_dataset(train_datasets[0])
-    test_datasets = [TestDataset.AIME, TestDataset.AIME25, TestDataset.AMC, TestDataset.MATH, TestDataset.MINERVA, TestDataset.OLYMPIAD_BENCH]
+    test_datasets = [TestDataset.AIME, TestDataset.AIME25, TestDataset.AMC, TestDataset.MATH, TestDataset.MINERVA, TestDataset.OLYMPIAD_BENCH, TestDataset.GPQA]
     
     test_datasets_data = [load_dataset(d) for d in test_datasets]
 
     # Process training data
     train_data: List[Dict[str, Any]] = []
-    process_fn = make_map_fn('train')
+    process_fn = make_map_fn('train', train_datasets[0].value.lower())
     for idx, example in enumerate(train_dataset):
-        processed_example = process_fn(example, idx)
+        processed_example = process_fn(example, idx, train_datasets[0].value.lower())
         if processed_example is not None:
             train_data.append(processed_example)
 
     # Process and save each test dataset separately
     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
         test_data: List[Dict[str, Any]] = []
-        process_fn = make_map_fn('test')
+        process_fn = make_map_fn('test', test_dataset.value.lower())
         for idx, example in enumerate(test_data_list):
-            processed_example = process_fn(example, idx)
+            processed_example = process_fn(example, idx, test_dataset.value.lower())
             if processed_example is not None:
                 test_data.append(processed_example)
 
         dataset_name = test_dataset.value.lower()
+        with open(os.path.join(local_dir, f'{dataset_name}.json'), 'w', encoding='utf-8') as f:
+            json.dump(test_data, f, ensure_ascii=False, indent=4)
         test_df = pd.DataFrame(test_data)
         test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
         print(f"{dataset_name} test data size:", len(test_data))
 
     # Save training dataset
     print("train data size:", len(train_data))
+    with open(os.path.join(local_dir, 'train.json'), 'w', encoding='utf-8') as f:
+        json.dump(train_data, f, ensure_ascii=False, indent=4)
     train_df = pd.DataFrame(train_data)
+    print(os.path.join(local_dir, 'train.parquet'))
     train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))
 
     # Optionally copy to HDFS

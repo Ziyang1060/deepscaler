@@ -60,6 +60,7 @@ class RewardOutput:
     """
     reward: float
     is_correct: bool
+    parse_answer: str = ''
 
 
 class RewardFn:

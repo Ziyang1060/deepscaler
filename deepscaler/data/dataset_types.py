@@ -33,6 +33,7 @@ class TestDataset(enum.Enum):
     MATH = 'MATH'  # Math 500 problems
     MINERVA = 'MINERVA'  # Minerva dataset
     OLYMPIAD_BENCH = 'OLYMPIAD_BENCH'  # Olympiad benchmark problems
+    GPQA = "GPQA"  # 198 multiple-choice questions from the GPQA dataset
 
 """Type alias for either training or testing dataset types."""
 Dataset = Union[TrainDataset, TestDataset]

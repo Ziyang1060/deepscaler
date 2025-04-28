@@ -25,10 +25,13 @@ Generate responses given a dataset of prompts
 """
 import csv
 import ray
+import re
 import numpy as np
 
 import os
 from tabulate import tabulate
+from functools import partial
+
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -47,32 +50,38 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.hdfs_io import makedirs
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from sklearn.metrics import confusion_matrix
+from verl.utils.evaluation_function import parse_parquet, bootstrap_metric, calc_maj_val
 
 
-@hydra.main(config_path='config', config_name='generation', version_base=None)
+    
+@hydra.main(config_path='config', config_name='verification_generation', version_base=None)
 def main(config):
     from pprint import pprint
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+    
+    output_dir = os.path.join(config.data.output_folder, config.data.prompt_version, config.data.prompt_type)
 
     # Check if output file already exists
-    if os.path.exists(config.data.output_path):
-        print(f"Output file {config.data.output_path} already exists. Skipping generation and proceeding to evaluation.")
-        dataset = pd.read_parquet(config.data.output_path)
+    if os.path.exists(output_dir):
+        print(f"Output file {output_dir} already exists. Skipping generation and proceeding to evaluation.")
+        dataset, n_sample, dataset_name = parse_parquet(config=config, data_path=config.data.path, model=os.path.basename(config.model.path), prompt_version=config.data.prompt_version)
+        origin_dataset = pd.read_parquet(os.path.join(output_dir, f'{dataset_name}.parquet'))
+
     else:
         local_path = copy_local_path_from_hdfs(config.model.path)
         from verl.utils import hf_tokenizer
         tokenizer = hf_tokenizer(local_path)
 
-        if config.rollout.temperature == 0.:
-            assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
-
         # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
-        dataset = pd.read_parquet(config.data.path)
+        dataset, n_sample, dataset_name = parse_parquet(config=config, data_path=config.data.path, model=os.path.basename(config.model.path), prompt_version=config.data.prompt_version)
+        origin_dataset = pd.read_parquet(config.data.path)
+
         chat_lst = dataset[config.data.prompt_key].tolist()
 
-        chat_lst = [chat.tolist() for chat in chat_lst]
+        # chat_lst = [chat.tolist() for chat in chat_lst]
 
         tokenizer.padding_side = 'left'
         if tokenizer.pad_token is None:
@@ -90,17 +99,14 @@ def main(config):
         num_batch = (total_samples // config_batch_size) + 1
         output_lst = []  # We'll reshape at the end
 
-        for batch_idx in range(num_batch):
+        from tqdm import tqdm
+        for batch_idx in tqdm(range(num_batch), desc='processing num_batch'):
             print(f'[{batch_idx+1}/{num_batch}] Start to process.')
             batch_chat_lst = chat_lst[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
             
-            # Repeat the batch n_samples times
-            repeated_chat_lst = []
-            for chat in batch_chat_lst:
-                repeated_chat_lst.extend([chat] * config.data.n_samples)
             
             # ------------------------------
-            inputs = tokenizer.apply_chat_template(repeated_chat_lst,
+            inputs = tokenizer.apply_chat_template(batch_chat_lst,
                                                  add_generation_prompt=True,
                                                  padding=True,
                                                  truncation=True,
@@ -148,76 +154,115 @@ def main(config):
             
             output_lst.extend(output_text_unpad)
 
-        # Reshape output_lst from (total_samples,) to (n_data, n_samples)
-        total_samples = len(output_lst)
-        n_data = total_samples // config.data.n_samples
-        output_lst = np.array(output_lst).reshape(n_data, config.data.n_samples).tolist()
 
+        # Reshape the output list to match the original dataset
+        output_lst = np.array(output_lst).reshape(len(origin_dataset), n_sample).tolist()
+        chat_lst = np.array(chat_lst).reshape(len(origin_dataset), n_sample).tolist()
+        
         # Add to the data frame
-        dataset['responses'] = output_lst
-
+        origin_dataset['verification_response'] = output_lst 
+        origin_dataset['chat_lst'] = chat_lst
+        origin_dataset['prompt_type'] = config.data.prompt_type
+        
         # Write to a new parquet
-        output_dir = os.path.dirname(config.data.output_path)
+        output_dir = os.path.join(config.data.output_folder, config.data.prompt_version, config.data.prompt_type)
         makedirs(output_dir, exist_ok=True)
-        dataset.to_parquet(config.data.output_path)
-    
-    output_dir = os.path.dirname(config.data.output_path)
+        origin_dataset.to_parquet(os.path.join(output_dir, f'{dataset_name}.parquet'))
+        
+
+
+
+    dataset = origin_dataset
+    output_dir = os.path.join(config.data.output_folder, config.data.prompt_version, config.data.prompt_type)
     # Compute evaluation metrics
     prompts = dataset[config.data.prompt_key]
-    responses = dataset['responses']  # Using the generated responses
-    data_sources = dataset[config.data.data_source_key]
-    reward_model_data = dataset[config.data.reward_model_key]
+    responses = dataset['verification_response']  # Using the generated responses
+    correctnesss = dataset['correct']
+    parse_answer_lst = dataset['parse_answer']
 
-    passes = 0
-    passes_16 = 0
     total = len(dataset)
     total_scores = []
-    parse_answer = []
-    
-    for i in range(total):
-        response_lst = responses[i]
-        data_source = data_sources[i]
-        prompt = prompts[i]
-        reward_data = reward_model_data[i]
-        reward_fn = select_reward_fn(data_source)
-        ground_truth = reward_data['ground_truth']
-        score_lst = []
-        answer_lst = []
-        for r in response_lst:
-            reward = reward_fn(r, ground_truth)
-            score_lst.append(reward.is_correct)
-            answer_lst.append(reward.parse_answer)
-        max_score = np.max(score_lst)
-        max_score_16 = np.max(score_lst[:16])
-        total_scores.append(score_lst)
-        parse_answer.append(answer_lst)
-        if max_score == 1:
-            passes += 1
-        if max_score_16 == 1:
-            passes_16 += 1
 
-    n_samples = config.data.n_samples
-    pass_at_n = passes / total
-    pass_at_16 = passes_16 / total
-    pass_at_1 = np.mean(total_scores)
-    dataset['correct'] = np.array(total_scores)
-    dataset['parse_answer'] = np.array(parse_answer)
-    dataset.to_parquet(config.data.output_path)
+    for i in range(total):
+        verification_response_lst = responses[i].tolist()
+        prompt = prompts[i]
+        correctness = correctnesss[i]
+        
+        def parse_verification(veri_res: str):
+            try:
+                PARSE_PATTERN = r"(?i)Verification[ \t]*:[ \t]*(Yes|No)"
+                match = re.search(PARSE_PATTERN, veri_res)
+                extracted_answer = match.group(1) if match else None
+                if extracted_answer.lower() == 'yes':
+                    return 1
+                return 0
+            # all failures return false
+            except TypeError:
+                print("Error in extracting verification: {}".format(veri_res))
+                return -1
+        score_lst = []
+        for r, correct in zip(verification_response_lst, correctness):
+            score = parse_verification(r)
+            score_lst.append(int(correct == score))
+            
+        total_scores.append(score_lst)
     
-    # Save metrics to CSV
-    csv_path = os.path.join(output_dir, 'pass.csv')
+
+    dataset['verification_correctness'] = np.array(total_scores)
+    dataset.to_parquet(os.path.join(output_dir, f'{dataset_name}.parquet'))
     
-    # Prepare the row data
-    # Extract the dataset name from the path
-    dataset_name = os.path.basename(config.data.path)
+    # calculatle confusion matrix
+    all_groundtrue = []
+    all_predict = []
+    for index, row in dataset.iterrows():
+        all_groundtrue.extend(row['correct'].tolist())
+        all_predict.extend(row['verification_correctness'].tolist())
+    conf_matrix = confusion_matrix(all_groundtrue, all_predict)
+    total_samples = conf_matrix.sum()
+    
+    n = config.data.n
+    lst_bon_mean = []
+    lst_won_mean = []
+    lst_maj_n = []
+    for idx, item in dataset.iterrows():
+        data = []
+        for parse_answer, verification_correctness in zip(item['parse_answer'].tolist(), item['verification_correctness'].tolist()):
+            data.append({'pred': parse_answer, 'val': verification_correctness})
+            
+        (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
+            data,
+            subset_size=n,
+            reduce_fns=[
+                lambda arr: np.max([d["val"] for d in arr]),
+                lambda arr: np.min([d["val"] for d in arr]),
+            ]
+        )
+        
+        maj_val = calc_maj_val(data[0:n], vote_key='pred', val_key='val')
+        reward_fn = select_reward_fn(item[config.data.data_source_key])
+        maj_val_score = reward_fn('boxed{TMP}'.replace("TMP", maj_val), item[config.data.reward_model_key]['ground_truth'])
+        
+        lst_bon_mean.append(bon_mean)
+        lst_won_mean.append(won_mean)
+        lst_maj_n.append(maj_val_score.is_correct)
+    
+    
+
     row_data = {
         'model_path': config.model.path,
-        'dataset': dataset_name,
-        'pass@1': pass_at_1,
-        'pass@16': pass_at_16,
-        f'pass@{n_samples}': pass_at_n
+        'dataset_name': config.data.path,
+        "TP": conf_matrix[0][0] / total_samples,
+        "TN": conf_matrix[1][1] / total_samples,
+        "FP": conf_matrix[1][0] / total_samples,
+        "FN": conf_matrix[0][1] / total_samples,
+        "accuracy": (conf_matrix[0][0] + conf_matrix[1][1]) / total_samples,
+        f"Best_of_{n}": np.mean(lst_bon_mean),
+        f"Worst_of_{n}": np.mean(lst_won_mean),
+        f"Maj_of_{n}": np.mean(lst_maj_n),
     }
-
+    
+    # Save metrics to CSV
+    csv_path = os.path.join(output_dir, 'evaluation.csv')
     # Check if file exists
     file_exists = os.path.isfile(csv_path)
     
@@ -227,15 +272,31 @@ def main(config):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row_data)
-
+    
     # Convert the row data into a list of lists format for tabulate
     table_data = [[k, v] for k, v in row_data.items()]
     
     # Print table
     print(tabulate(table_data, headers=['Metric', 'Value'], tablefmt='grid'))
+    
 
 # Add the select_reward_fn from main_eval.py
 def select_reward_fn(data_source):
+    # if data_source == 'gpqa':
+    #     def gpqa_reward_fn(response, ground_truth):
+    #         import re
+    #         ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[ \t]*\$?([A-D])\$?"
+    #         match = re.search(ANSWER_PATTERN_MULTICHOICE, response)
+    #         cur_ans = match.group(1) if match else None
+    #         if cur_ans not in ['A', 'B', 'C', 'D']:
+    #             print('Error in extracting answer: cur_ans={}'.format(cur_ans))
+    #             # print(generated_responses[i])
+    #             cur_ans = ""
+    #             return 0
+    #         if cur_ans == ground_truth:
+    #             return 1
+    #         return 0
+    #     return gpqa_reward_fn
     if data_source == 'lighteval/MATH':
         from verl.utils.reward_score import math
         return math.compute_score

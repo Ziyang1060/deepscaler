@@ -40,12 +40,12 @@ class RewardMathFn(RewardFn):
         
         model_answer = extract_answer(model_solution)
         if model_answer is None:
-            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+            return RewardOutput(reward=self.config.format_error_reward, is_correct=False, parse_answer='')
 
         # Process the ground truth(s)
         ground_truths = input.ground_truth.get("answer", None)
         if ground_truths is None:
-            return RewardOutput(reward=self.config.unk_error_reward, is_correct=False)
+            return RewardOutput(reward=self.config.unk_error_reward, is_correct=False, parse_answer=model_answer)
         
         # Convert single answer to list for uniform processing
         if isinstance(ground_truths, (str, float, int)):
@@ -63,13 +63,13 @@ class RewardMathFn(RewardFn):
                 processed_ground_truths.append(truth)
         
         if not processed_ground_truths:
-            return RewardOutput(reward=self.config.unk_error_reward, is_correct=False)
+            return RewardOutput(reward=self.config.unk_error_reward, is_correct=False, parse_answer=model_answer)
 
         # Check against all possible correct answers
         for ground_truth in processed_ground_truths:
             is_correct = grade_answer_mathd(model_answer, ground_truth) or grade_answer_sympy(model_answer, ground_truth)
             if is_correct:
-                return RewardOutput(reward=self.config.correct_reward, is_correct=True)
+                return RewardOutput(reward=self.config.correct_reward, is_correct=True, parse_answer=model_answer)
 
         # If latex heuristics fail and ORM is enabled, use LLM as ORM to evaluate correctness
         if self.config.use_math_orm:
@@ -82,7 +82,7 @@ class RewardMathFn(RewardFn):
                     )
 
                     if "[[YES]]" in orm_response:
-                        return RewardOutput(reward=self.config.correct_reward, is_correct=True)
+                        return RewardOutput(reward=self.config.correct_reward, is_correct=True, parse_answer=model_answer)
                 except Exception as e:
                     print ("Error calling Gemini ORM, trying OAI RM")
                     orm_response = call_oai_rm_llm(
@@ -93,17 +93,17 @@ class RewardMathFn(RewardFn):
                     )
                     
                     if "[[YES]]" in orm_response:
-                        return RewardOutput(reward=self.config.correct_reward, is_correct=True)
+                        return RewardOutput(reward=self.config.correct_reward, is_correct=True, parse_answer=model_answer)
                     continue
                 
-        return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
+        return RewardOutput(reward=self.config.incorrect_reward, is_correct=False, parse_answer=model_answer)
 
 def deepscaler_reward_fn(solution_str: str, ground_truth: Union[str, List[str]], enable_llm = False):
     reward_config = RewardConfig()
     reward_config.use_math_orm = enable_llm
     reward_fn = RewardMathFn(reward_config)
     reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, ground_truth={"answer": ground_truth}))
-    return reward_response.is_correct
+    return reward_response
 
 if __name__ == "__main__":
     reward = RewardMathFn(RewardConfig)
